@@ -12,6 +12,7 @@ import (
 	"github.com/juju/errors"
 	"github.com/juju/loggo"
 	"github.com/juju/names"
+	jujutxn "github.com/juju/txn"
 	"github.com/juju/utils"
 	"labix.org/v2/mgo"
 	"labix.org/v2/mgo/bson"
@@ -24,8 +25,6 @@ import (
 	"github.com/juju/juju/state/presence"
 	"github.com/juju/juju/tools"
 	"github.com/juju/juju/version"
-
-	statetxn "github.com/juju/juju/state/txn"
 )
 
 var unitLogger = loggo.GetLogger("juju.state.unit")
@@ -164,11 +163,6 @@ func (u *Unit) globalKey() string {
 	return unitGlobalKey(u.doc.Name)
 }
 
-// ActionKey returns the globalKey to fulfill ActionReceiver
-func (u *Unit) ActionKey() string {
-	return u.globalKey()
-}
-
 // Life returns whether the unit is Alive, Dying or Dead.
 func (u *Unit) Life() Life {
 	return u.doc.Life
@@ -283,7 +277,7 @@ func (u *Unit) Destroy() (err error) {
 	buildTxn := func(attempt int) ([]txn.Op, error) {
 		if attempt > 0 {
 			if err := unit.Refresh(); errors.IsNotFound(err) {
-				return nil, statetxn.ErrNoOperations
+				return nil, jujutxn.ErrNoOperations
 			} else if err != nil {
 				return nil, err
 			}
@@ -291,13 +285,13 @@ func (u *Unit) Destroy() (err error) {
 		switch ops, err := unit.destroyOps(); err {
 		case errRefresh:
 		case errAlreadyDying:
-			return nil, statetxn.ErrNoOperations
+			return nil, jujutxn.ErrNoOperations
 		case nil:
 			return ops, nil
 		default:
 			return nil, err
 		}
-		return nil, statetxn.ErrNoOperations
+		return nil, jujutxn.ErrNoOperations
 	}
 	if err = unit.st.run(buildTxn); err == nil {
 		if err = unit.Refresh(); errors.IsNotFound(err) {
@@ -554,7 +548,7 @@ func (u *Unit) Remove() (err error) {
 	buildTxn := func(attempt int) ([]txn.Op, error) {
 		if attempt > 0 {
 			if err := unit.Refresh(); errors.IsNotFound(err) {
-				return nil, statetxn.ErrNoOperations
+				return nil, jujutxn.ErrNoOperations
 			} else if err != nil {
 				return nil, err
 			}
@@ -562,13 +556,13 @@ func (u *Unit) Remove() (err error) {
 		switch ops, err := unit.removeOps(isDeadDoc); err {
 		case errRefresh:
 		case errAlreadyDying:
-			return nil, statetxn.ErrNoOperations
+			return nil, jujutxn.ErrNoOperations
 		case nil:
 			return ops, nil
 		default:
 			return nil, err
 		}
-		return nil, statetxn.ErrNoOperations
+		return nil, jujutxn.ErrNoOperations
 	}
 	return unit.st.run(buildTxn)
 }
@@ -821,7 +815,7 @@ func (u *Unit) SetCharmURL(curl *charm.URL) (err error) {
 			return nil, err
 		} else if count == 1 {
 			// Already set
-			return nil, statetxn.ErrNoOperations
+			return nil, jujutxn.ErrNoOperations
 		}
 		if count, err := u.st.charms.FindId(curl).Count(); err != nil {
 			return nil, err
@@ -1597,5 +1591,5 @@ func (u *Unit) ClearResolved() error {
 
 // WatchActions starts and returns an ActionWatcher
 func (u *Unit) WatchActions() StringsWatcher {
-	return newActionWatcher(u.st, actionPrefix(u))
+	return newActionWatcher(u.st, u)
 }

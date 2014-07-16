@@ -40,6 +40,7 @@ import (
 	"github.com/juju/utils"
 
 	"github.com/juju/juju/constraints"
+	"github.com/juju/juju/environmentserver/authentication"
 	"github.com/juju/juju/environs"
 	"github.com/juju/juju/environs/bootstrap"
 	"github.com/juju/juju/environs/config"
@@ -81,18 +82,30 @@ func SampleConfig() testing.Attrs {
 
 		"secret":       "pork",
 		"state-server": true,
+		"prefer-ipv6":  true,
 	}
 }
 
 // stateInfo returns a *state.Info which allows clients to connect to the
-// shared dummy state, if it exists.
-func stateInfo() *state.Info {
+// shared dummy state, if it exists. If preferIPv6 is true, an IPv6 endpoint
+// will be added as primary.
+func stateInfo(preferIPv6 bool) *authentication.MongoInfo {
 	if gitjujutesting.MgoServer.Addr() == "" {
 		panic("dummy environ state tests must be run with MgoTestPackage")
 	}
-	return &state.Info{
+	mongoPort := strconv.Itoa(gitjujutesting.MgoServer.Port())
+	var addrs []string
+	if preferIPv6 {
+		addrs = []string{
+			net.JoinHostPort("::1", mongoPort),
+			net.JoinHostPort("localhost", mongoPort),
+		}
+	} else {
+		addrs = []string{net.JoinHostPort("localhost", mongoPort)}
+	}
+	return &authentication.MongoInfo{
 		Info: mongo.Info{
-			Addrs:  []string{gitjujutesting.MgoServer.Addr()},
+			Addrs:  addrs,
 			CACert: testing.CACert,
 		},
 	}
@@ -132,7 +145,7 @@ type OpStartInstance struct {
 	Constraints  constraints.Value
 	Networks     []string
 	NetworkInfo  []network.Info
-	Info         *state.Info
+	Info         *authentication.MongoInfo
 	APIInfo      *api.Info
 	Secret       string
 }
@@ -195,6 +208,7 @@ type environState struct {
 	httpListener net.Listener
 	apiServer    *apiserver.Server
 	apiState     *state.State
+	preferIPv6   bool
 }
 
 // environ represents a client's connection to a given environment's
@@ -310,7 +324,7 @@ func newState(name string, ops chan<- Operation, policy state.Policy) *environSt
 // listen starts a network listener listening for http
 // requests to retrieve files in the state's storage.
 func (s *environState) listen() {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", ":0")
 	if err != nil {
 		panic(fmt.Errorf("cannot start listener: %v", err))
 	}
@@ -588,6 +602,7 @@ func (e *environ) Bootstrap(ctx environs.BootstrapContext, args environs.Bootstr
 	if err := e.checkBroken("Bootstrap"); err != nil {
 		return err
 	}
+	network.InitializeFromConfig(e.Config())
 	password := e.Config().AdminSecret()
 	if password == "" {
 		return fmt.Errorf("admin-secret is required for bootstrap")
@@ -611,11 +626,13 @@ func (e *environ) Bootstrap(ctx environs.BootstrapContext, args environs.Bootstr
 	if estate.bootstrapped {
 		return fmt.Errorf("environment is already bootstrapped")
 	}
+	estate.preferIPv6 = e.Config().PreferIPv6()
+	instIds := []instance.Id{"localhost"}
 	// Write the bootstrap file just like a normal provider. However
 	// we need to release the mutex for the save state to work, so regain
 	// it after the call.
 	estate.mu.Unlock()
-	if err := bootstrap.SaveState(e.Storage(), &bootstrap.BootstrapState{StateInstances: []instance.Id{"localhost"}}); err != nil {
+	if err := bootstrap.SaveState(e.Storage(), &bootstrap.BootstrapState{StateInstances: instIds}); err != nil {
 		logger.Errorf("failed to save state instances: %v", err)
 		estate.mu.Lock() // otherwise defered unlock will fail
 		return err
@@ -626,7 +643,7 @@ func (e *environ) Bootstrap(ctx environs.BootstrapContext, args environs.Bootstr
 		// TODO(rog) factor out relevant code from cmd/jujud/bootstrap.go
 		// so that we can call it here.
 
-		info := stateInfo()
+		info := stateInfo(estate.preferIPv6)
 		st, err := state.Initialize(info, cfg, mongo.DefaultDialOpts(), estate.statePolicy)
 		if err != nil {
 			panic(err)
@@ -658,7 +675,7 @@ func (e *environ) Bootstrap(ctx environs.BootstrapContext, args environs.Bootstr
 	return nil
 }
 
-func (e *environ) StateInfo() (*state.Info, *api.Info, error) {
+func (e *environ) StateInfo() (*authentication.MongoInfo, *api.Info, error) {
 	estate, err := e.state()
 	if err != nil {
 		return nil, nil, err
@@ -674,7 +691,7 @@ func (e *environ) StateInfo() (*state.Info, *api.Info, error) {
 	if !estate.bootstrapped {
 		return nil, nil, environs.ErrNotBootstrapped
 	}
-	return stateInfo(), &api.Info{
+	return stateInfo(estate.preferIPv6), &api.Info{
 		Addrs:  []string{estate.apiServer.Addr()},
 		CACert: testing.CACert,
 	}, nil
@@ -751,19 +768,24 @@ func (e *environ) StartInstance(args environs.StartInstanceParams) (instance.Ins
 	if _, ok := e.Config().CACert(); !ok {
 		return nil, nil, nil, fmt.Errorf("no CA certificate in environment configuration")
 	}
-	if args.MachineConfig.StateInfo.Tag != names.NewMachineTag(machineId).String() {
+	if args.MachineConfig.MongoInfo.Tag != names.NewMachineTag(machineId) {
 		return nil, nil, nil, fmt.Errorf("entity tag must match started machine")
 	}
-	if args.MachineConfig.APIInfo.Tag != names.NewMachineTag(machineId).String() {
+	if args.MachineConfig.APIInfo.Tag != names.NewMachineTag(machineId) {
 		return nil, nil, nil, fmt.Errorf("entity tag must match started machine")
 	}
 	logger.Infof("would pick tools from %s", args.Tools)
 	series := args.Tools.OneSeries()
 
 	idString := fmt.Sprintf("%s-%d", e.name, estate.maxId)
+	addrs := network.NewAddresses(idString+".dns", "127.0.0.1")
+	if estate.preferIPv6 {
+		addrs = append(addrs, network.NewAddress(fmt.Sprintf("fc00::%x", estate.maxId+1), network.ScopeUnknown))
+	}
+	logger.Debugf("StartInstance addresses: %v", addrs)
 	i := &dummyInstance{
 		id:           instance.Id(idString),
-		addresses:    network.NewAddresses(idString + ".dns"),
+		addresses:    addrs,
 		ports:        make(map[network.Port]bool),
 		machineId:    machineId,
 		series:       series,
@@ -835,7 +857,7 @@ func (e *environ) StartInstance(args environs.StartInstanceParams) (instance.Ins
 		Networks:     args.MachineConfig.Networks,
 		NetworkInfo:  networkInfo,
 		Instance:     i,
-		Info:         args.MachineConfig.StateInfo,
+		Info:         args.MachineConfig.MongoInfo,
 		APIInfo:      args.MachineConfig.APIInfo,
 		Secret:       e.ecfg().secret(),
 	}

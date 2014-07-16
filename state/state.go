@@ -20,35 +20,34 @@ import (
 	"github.com/juju/errors"
 	"github.com/juju/loggo"
 	"github.com/juju/names"
+	jujutxn "github.com/juju/txn"
 	"github.com/juju/utils"
 	"labix.org/v2/mgo"
 	"labix.org/v2/mgo/bson"
 	"labix.org/v2/mgo/txn"
 
 	"github.com/juju/juju/constraints"
+	"github.com/juju/juju/environmentserver/authentication"
 	"github.com/juju/juju/environs/config"
 	"github.com/juju/juju/mongo"
 	"github.com/juju/juju/state/api/params"
 	"github.com/juju/juju/state/multiwatcher"
 	"github.com/juju/juju/state/presence"
-	statetxn "github.com/juju/juju/state/txn"
 	"github.com/juju/juju/state/watcher"
 	"github.com/juju/juju/version"
 )
 
 var logger = loggo.GetLogger("juju.state")
 
-// BootstrapNonce is used as a nonce for the state server machine.
 const (
-	BootstrapNonce = "user-admin:bootstrap"
-	AdminUser      = "admin"
+	AdminUser = "admin"
 )
 
 // State represents the state of an environment
 // managed by juju.
 type State struct {
-	transactionRunner statetxn.Runner
-	info              *Info
+	transactionRunner jujutxn.Runner
+	mongoInfo         *authentication.MongoInfo
 	policy            Policy
 	db                *mgo.Database
 	environments      *mgo.Collection
@@ -102,7 +101,7 @@ func (st *State) runTransaction(ops []txn.Op) error {
 }
 
 // run is a convenience method delegating to transactionRunner.
-func (st *State) run(transactions statetxn.TransactionSource) error {
+func (st *State) run(transactions jujutxn.TransactionSource) error {
 	return st.transactionRunner.Run(transactions)
 }
 
@@ -220,7 +219,7 @@ func (st *State) SetEnvironAgentVersion(newVersion version.Number) (err error) {
 		}
 		if newVersion.String() == currentVersion {
 			// Nothing to do.
-			return nil, statetxn.ErrNoOperations
+			return nil, jujutxn.ErrNoOperations
 		}
 
 		if err := st.checkCanUpgrade(currentVersion, newVersion.String()); err != nil {
@@ -235,7 +234,7 @@ func (st *State) SetEnvironAgentVersion(newVersion version.Number) (err error) {
 		}}
 		return ops, nil
 	}
-	if err = st.run(buildTxn); err == statetxn.ErrExcessiveContention {
+	if err = st.run(buildTxn); err == jujutxn.ErrExcessiveContention {
 		err = errors.Annotate(err, "cannot set agent version")
 	}
 	return err
@@ -663,7 +662,7 @@ func (st *State) PrepareStoreCharmUpload(curl *charm.URL) (*Charm, error) {
 			// The charm exists and it's either uploaded or still
 			// pending, but it's not a placeholder. In any case,
 			// there's nothing to do.
-			return nil, statetxn.ErrNoOperations
+			return nil, jujutxn.ErrNoOperations
 		} else if err == mgo.ErrNotFound {
 			// Prepare the pending charm document for insertion.
 			uploadedCharm = charmDoc{
@@ -736,7 +735,7 @@ func (st *State) AddStoreCharmPlaceholder(curl *charm.URL) (err error) {
 			return nil, err
 		}
 		if err == nil {
-			return nil, statetxn.ErrNoOperations
+			return nil, jujutxn.ErrNoOperations
 		}
 
 		// Delete all previous placeholders so we don't fill up the database with unused data.
@@ -1384,22 +1383,9 @@ func (st *State) ActionByTag(tag names.Tag) (*Action, error) {
 	return st.Action(actionIdFromTag(actionTag))
 }
 
-// actionIdFromTag converts an ActionTag to an actionId
-func actionIdFromTag(tag names.ActionTag) string {
-	prefix := actionPrefixFromUnitId(tag.UnitTag().Id())
-	return actionId(prefix, tag.Sequence())
-}
-
 // matchingActions finds actions that match ActionReceiver
 func (st *State) matchingActions(ar ActionReceiver) ([]*Action, error) {
-	prefix := actionPrefix(ar)
-	return st.matchingActionsByPrefix(prefix)
-}
-
-// matchingActionsByUnitId finds actions with a given unit prefix
-func (st *State) matchingActionsByUnitId(unitId string) ([]*Action, error) {
-	prefix := actionPrefixFromUnitId(unitId)
-	return st.matchingActionsByPrefix(prefix)
+	return st.matchingActionsByPrefix(ar.Name())
 }
 
 // matchingActionsByPrefix finds actions with a given prefix
@@ -1407,7 +1393,7 @@ func (st *State) matchingActionsByPrefix(prefix string) ([]*Action, error) {
 	var doc actionDoc
 	var actions []*Action
 
-	sel := bson.D{{"_id", bson.D{{"$regex", "^" + regexp.QuoteMeta(prefix)}}}}
+	sel := bson.D{{"_id", bson.D{{"$regex", "^" + regexp.QuoteMeta(ensureActionMarker(prefix))}}}}
 	iter := st.actions.Find(sel).Iter()
 
 	for iter.Next(&doc) {

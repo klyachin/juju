@@ -18,6 +18,7 @@ import (
 	"github.com/juju/loggo"
 	"github.com/juju/names"
 	"github.com/juju/utils"
+	"github.com/juju/utils/symlink"
 	"github.com/juju/utils/voyeur"
 	"labix.org/v2/mgo"
 	"launchpad.net/gnuflag"
@@ -52,6 +53,7 @@ import (
 	"github.com/juju/juju/worker/machineenvironmentworker"
 	"github.com/juju/juju/worker/machiner"
 	"github.com/juju/juju/worker/minunitsworker"
+	"github.com/juju/juju/worker/networker"
 	"github.com/juju/juju/worker/peergrouper"
 	"github.com/juju/juju/worker/provisioner"
 	"github.com/juju/juju/worker/resumer"
@@ -59,7 +61,6 @@ import (
 	"github.com/juju/juju/worker/singular"
 	"github.com/juju/juju/worker/terminationworker"
 	"github.com/juju/juju/worker/upgrader"
-	"github.com/juju/utils/symlink"
 )
 
 var logger = loggo.GetLogger("juju.cmd.jujud")
@@ -155,12 +156,13 @@ func (a *MachineAgent) Run(_ *cmd.Context) error {
 	// lines of all logging in the log file.
 	loggo.RemoveWriter("logfile")
 	defer a.tomb.Done()
-	logger.Infof("machine agent %v start (%s [%s])", a.Tag(), version.Current, runtime.Compiler)
 	if err := a.ReadConfig(a.Tag().String()); err != nil {
 		return fmt.Errorf("cannot read agent configuration: %v", err)
 	}
+	logger.Infof("machine agent %v start (%s [%s])", a.Tag(), version.Current, runtime.Compiler)
 	a.configChangedVal.Set(struct{}{})
 	agentConfig := a.CurrentConfig()
+	network.InitializeFromConfig(agentConfig)
 	charm.CacheDir = filepath.Join(agentConfig.DataDir(), "charmcache")
 	if err := a.createJujuRun(agentConfig.DataDir()); err != nil {
 		return fmt.Errorf("cannot create juju run symlink: %v", err)
@@ -299,6 +301,9 @@ func (a *MachineAgent) APIWorker() (worker.Worker, error) {
 	})
 	a.startWorkerAfterUpgrade(runner, "rsyslog", func() (worker.Worker, error) {
 		return newRsyslogConfigWorker(st.Rsyslog(), agentConfig, rsyslogMode)
+	})
+	a.startWorkerAfterUpgrade(runner, "networker", func() (worker.Worker, error) {
+		return networker.NewNetworker(st.Networker(), agentConfig), nil
 	})
 
 	// If not a local provider bootstrap machine, start the worker to
@@ -528,10 +533,12 @@ func (a *MachineAgent) limitLoginsDuringUpgrade(creds params.Creds) error {
 		}
 		switch authTag := authTag.(type) {
 		case names.UserTag:
-			return nil // user logins always allowed
+			// use a restricted API mode
+			return apiserver.UpgradeInProgressError
 		case names.MachineTag:
 			if authTag == a.Tag() {
-				return nil // allow logins from the local machine
+				// allow logins from the local machine
+				return nil
 			}
 		}
 		return errors.Errorf("login for %q blocked because upgrade is in progress", authTag)
@@ -540,19 +547,23 @@ func (a *MachineAgent) limitLoginsDuringUpgrade(creds params.Creds) error {
 
 // ensureMongoServer ensures that mongo is installed and running,
 // and ready for opening a state connection.
-func (a *MachineAgent) ensureMongoServer(agentConfig agent.Config) error {
+func (a *MachineAgent) ensureMongoServer(agentConfig agent.Config) (err error) {
 	a.mongoInitMutex.Lock()
 	defer a.mongoInitMutex.Unlock()
 	if a.mongoInitialized {
 		logger.Debugf("mongo is already initialized")
 		return nil
 	}
+	defer func() {
+		if err == nil {
+			a.mongoInitialized = true
+		}
+	}()
 
 	servingInfo, ok := agentConfig.StateServingInfo()
 	if !ok {
 		return fmt.Errorf("state worker was started with no state serving info")
 	}
-	namespace := agentConfig.Value(agent.Namespace)
 
 	// When upgrading from a pre-HA-capable environment,
 	// we must add machine-0 to the admin database and
@@ -596,11 +607,11 @@ func (a *MachineAgent) ensureMongoServer(agentConfig agent.Config) error {
 	}
 
 	// ensureMongoServer installs/upgrades the upstart config as necessary.
-	if err := ensureMongoServer(
-		agentConfig.DataDir(),
-		namespace,
-		servingInfo,
-	); err != nil {
+	ensureServerParams, err := newEnsureServerParams(agentConfig)
+	if err != nil {
+		return err
+	}
+	if err := ensureMongoServer(ensureServerParams); err != nil {
 		return err
 	}
 	if !shouldInitiateMongoServer {
@@ -611,7 +622,7 @@ func (a *MachineAgent) ensureMongoServer(agentConfig agent.Config) error {
 	//
 	// TODO(axw) remove this when we no longer need
 	// to upgrade from pre-HA-capable environments.
-	stateInfo, ok := agentConfig.StateInfo()
+	stateInfo, ok := agentConfig.MongoInfo()
 	if !ok {
 		return fmt.Errorf("state worker was started with no state serving info")
 	}
@@ -626,17 +637,17 @@ func (a *MachineAgent) ensureMongoServer(agentConfig agent.Config) error {
 	if err := maybeInitiateMongoServer(peergrouper.InitiateMongoParams{
 		DialInfo:       dialInfo,
 		MemberHostPort: net.JoinHostPort(peerAddr, fmt.Sprint(servingInfo.StatePort)),
-		User:           stateInfo.Tag,
-		Password:       stateInfo.Password,
+		// TODO(dfc) InitiateMongoParams should take a Tag
+		User:     stateInfo.Tag.String(),
+		Password: stateInfo.Password,
 	}); err != nil {
 		return err
 	}
-	a.mongoInitialized = true
 	return nil
 }
 
 func (a *MachineAgent) ensureMongoAdminUser(agentConfig agent.Config) (added bool, err error) {
-	stateInfo, ok1 := agentConfig.StateInfo()
+	stateInfo, ok1 := agentConfig.MongoInfo()
 	servingInfo, ok2 := agentConfig.StateServingInfo()
 	if !ok1 || !ok2 {
 		return false, fmt.Errorf("no state serving info configuration")
@@ -654,7 +665,7 @@ func (a *MachineAgent) ensureMongoAdminUser(agentConfig agent.Config) (added boo
 		Namespace: agentConfig.Value(agent.Namespace),
 		DataDir:   agentConfig.DataDir(),
 		Port:      servingInfo.StatePort,
-		User:      stateInfo.Tag,
+		User:      stateInfo.Tag.String(),
 		Password:  stateInfo.Password,
 	})
 }
@@ -664,7 +675,7 @@ func isPreHAVersion(v version.Number) bool {
 }
 
 func openState(agentConfig agent.Config, dialOpts mongo.DialOpts) (_ *state.State, _ *state.Machine, err error) {
-	info, ok := agentConfig.StateInfo()
+	info, ok := agentConfig.MongoInfo()
 	if !ok {
 		return nil, nil, fmt.Errorf("no state info available")
 	}
@@ -677,7 +688,7 @@ func openState(agentConfig agent.Config, dialOpts mongo.DialOpts) (_ *state.Stat
 			st.Close()
 		}
 	}()
-	m0, err := st.FindEntity(agentConfig.Tag())
+	m0, err := st.FindEntity(agentConfig.Tag().String())
 	if err != nil {
 		if errors.IsNotFound(err) {
 			err = worker.ErrTerminateAgent
@@ -767,7 +778,7 @@ func (a *MachineAgent) upgradeWorker(
 				return err
 			}
 			var err error
-			info, ok := agentConfig.StateInfo()
+			info, ok := agentConfig.MongoInfo()
 			if !ok {
 				return fmt.Errorf("no state info available")
 			}
